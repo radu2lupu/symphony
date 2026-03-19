@@ -25,6 +25,15 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:ok, issue_ids}
     end
 
+    def fetch_comments(issue_id) do
+      send(self(), {:fetch_comments_called, issue_id})
+
+      case Process.get({__MODULE__, :fetch_comments_result}) do
+        nil -> {:ok, []}
+        result -> result
+      end
+    end
+
     def graphql(query, variables) do
       send(self(), {:graphql_called, query, variables})
 
@@ -184,6 +193,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "tracker delegates to memory and linear adapters" do
     issue = %Issue{id: "issue-1", identifier: "MT-1", state: "In Progress"}
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue, %{id: "ignored"}])
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, %{"issue-1" => [%{id: "comment-1", body: "## Codex Workpad", updated_at: ~U[2026-01-01 00:00:00Z]}]})
     Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
 
@@ -192,6 +202,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_candidate_issues()
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issues_by_states([" in progress ", 42])
     assert {:ok, [^issue]} = SymphonyElixir.Tracker.fetch_issue_states_by_ids(["issue-1"])
+    assert {:ok, [%{body: "## Codex Workpad"}]} = SymphonyElixir.Tracker.fetch_comments("issue-1")
     assert :ok = SymphonyElixir.Tracker.create_comment("issue-1", "comment")
     assert :ok = SymphonyElixir.Tracker.update_issue_state("issue-1", "Done")
     assert_receive {:memory_tracker_comment, "issue-1", "comment"}
@@ -216,6 +227,11 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:ok, ["issue-1"]} = Adapter.fetch_issue_states_by_ids(["issue-1"])
     assert_receive {:fetch_issue_states_by_ids_called, ["issue-1"]}
+
+    Process.put({FakeLinearClient, :fetch_comments_result}, {:ok, [%{id: "comment-1", body: "## Codex Workpad", updated_at: ~U[2026-01-01 00:00:00Z]}]})
+
+    assert {:ok, [%{body: "## Codex Workpad"}]} = Adapter.fetch_comments("issue-1")
+    assert_receive {:fetch_comments_called, "issue-1"}
 
     Process.put(
       {FakeLinearClient, :graphql_result},
@@ -354,6 +370,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_message" => "rendered",
                  "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
+                 "shared_memory" => %{
+                   "status" => nil,
+                   "query" => nil,
+                   "relevant_memories" => nil,
+                   "write_summary" => nil
+                 },
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
@@ -377,12 +399,16 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
+    {:ok, expected_workspace_path} = Workspace.path_for_issue("MT-HTTP")
 
     assert issue_payload == %{
              "issue_identifier" => "MT-HTTP",
              "issue_id" => "issue-http",
              "status" => "running",
-             "workspace" => %{"path" => Path.join(Config.settings!().workspace.root, "MT-HTTP")},
+             "workspace" => %{
+               "path" => expected_workspace_path,
+               "repositories" => []
+             },
              "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
              "running" => %{
                "session_id" => "thread-http",
@@ -392,6 +418,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event" => "notification",
                "last_message" => "rendered",
                "last_event_at" => nil,
+               "shared_memory" => %{
+                 "status" => nil,
+                 "query" => nil,
+                 "relevant_memories" => nil,
+                 "write_summary" => nil
+               },
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
              "retry" => nil,

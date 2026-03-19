@@ -42,7 +42,9 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          Application.delete_env(:symphony_elixir, :memory_tracker_comments)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          Application.delete_env(:symphony_elixir, :linear_project_config_module)
           File.rm_rf(workflow_root)
         end)
 
@@ -96,11 +98,16 @@ defmodule SymphonyElixir.TestSupport do
           tracker_endpoint: "https://api.linear.app/graphql",
           tracker_api_token: "token",
           tracker_project_slug: "project",
+          tracker_project_url: nil,
+          tracker_sync_project_states: false,
           tracker_assignee: nil,
           tracker_active_states: ["Todo", "In Progress"],
+          tracker_planning_states: ["Spec Review", "Needs Clarification", "Planning"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
+          workspace_registry_path: nil,
+          workspace_repositories: [],
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
@@ -117,6 +124,10 @@ defmodule SymphonyElixir.TestSupport do
           hook_after_run: nil,
           hook_before_remove: nil,
           hook_timeout_ms: 60_000,
+          total_recall_enabled: true,
+          total_recall_command: "total-recall",
+          total_recall_verify_evidence: false,
+          total_recall_install_during_init: true,
           observability_enabled: true,
           observability_refresh_ms: 1_000,
           observability_render_interval_ms: 16,
@@ -131,11 +142,16 @@ defmodule SymphonyElixir.TestSupport do
     tracker_endpoint = Keyword.get(config, :tracker_endpoint)
     tracker_api_token = Keyword.get(config, :tracker_api_token)
     tracker_project_slug = Keyword.get(config, :tracker_project_slug)
+    tracker_project_url = Keyword.get(config, :tracker_project_url)
+    tracker_sync_project_states = Keyword.get(config, :tracker_sync_project_states)
     tracker_assignee = Keyword.get(config, :tracker_assignee)
     tracker_active_states = Keyword.get(config, :tracker_active_states)
+    tracker_planning_states = Keyword.get(config, :tracker_planning_states)
     tracker_terminal_states = Keyword.get(config, :tracker_terminal_states)
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
+    workspace_registry_path = Keyword.get(config, :workspace_registry_path)
+    workspace_repositories = Keyword.get(config, :workspace_repositories)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
@@ -152,6 +168,10 @@ defmodule SymphonyElixir.TestSupport do
     hook_after_run = Keyword.get(config, :hook_after_run)
     hook_before_remove = Keyword.get(config, :hook_before_remove)
     hook_timeout_ms = Keyword.get(config, :hook_timeout_ms)
+    total_recall_enabled = Keyword.get(config, :total_recall_enabled)
+    total_recall_command = Keyword.get(config, :total_recall_command)
+    total_recall_verify_evidence = Keyword.get(config, :total_recall_verify_evidence)
+    total_recall_install_during_init = Keyword.get(config, :total_recall_install_during_init)
     observability_enabled = Keyword.get(config, :observability_enabled)
     observability_refresh_ms = Keyword.get(config, :observability_refresh_ms)
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
@@ -167,13 +187,15 @@ defmodule SymphonyElixir.TestSupport do
         "  endpoint: #{yaml_value(tracker_endpoint)}",
         "  api_key: #{yaml_value(tracker_api_token)}",
         "  project_slug: #{yaml_value(tracker_project_slug)}",
+        tracker_project_url && "  project_url: #{yaml_value(tracker_project_url)}",
+        "  sync_project_states: #{yaml_value(tracker_sync_project_states)}",
         "  assignee: #{yaml_value(tracker_assignee)}",
         "  active_states: #{yaml_value(tracker_active_states)}",
+        "  planning_states: #{yaml_value(tracker_planning_states)}",
         "  terminal_states: #{yaml_value(tracker_terminal_states)}",
         "polling:",
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
-        "workspace:",
-        "  root: #{yaml_value(workspace_root)}",
+        workspace_yaml(workspace_root, workspace_registry_path, workspace_repositories),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
@@ -188,6 +210,7 @@ defmodule SymphonyElixir.TestSupport do
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
+        memory_yaml(total_recall_enabled, total_recall_command, total_recall_verify_evidence, total_recall_install_during_init),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
         "---",
@@ -220,18 +243,65 @@ defmodule SymphonyElixir.TestSupport do
 
   defp yaml_value(value), do: yaml_value(to_string(value))
 
-  defp hooks_yaml(nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
-
-  defp hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, timeout_ms) do
+  defp workspace_yaml(root, registry_path, repositories) when repositories in [nil, []] do
     [
-      "hooks:",
-      "  timeout_ms: #{yaml_value(timeout_ms)}",
-      hook_entry("after_create", hook_after_create),
-      hook_entry("before_run", hook_before_run),
-      hook_entry("after_run", hook_after_run),
-      hook_entry("before_remove", hook_before_remove)
+      "workspace:",
+      "  root: #{yaml_value(root)}",
+      registry_path && "  registry_path: #{yaml_value(registry_path)}"
     ]
     |> Enum.reject(&is_nil/1)
+    |> Enum.join("\n")
+  end
+
+  defp workspace_yaml(root, registry_path, repositories) do
+    [
+      "workspace:",
+      "  root: #{yaml_value(root)}",
+      registry_path && "  registry_path: #{yaml_value(registry_path)}",
+      "  repositories:",
+      Enum.map(repositories, &repository_yaml_lines/1)
+    ]
+    |> List.flatten()
+    |> Enum.join("\n")
+  end
+
+  defp repository_yaml_lines(repository) do
+    [
+      "    - name: #{yaml_value(repository[:name])}",
+      "      source: #{yaml_value(repository[:source])}",
+      repository[:path] && "      path: #{yaml_value(repository[:path])}",
+      repository[:branch] && "      branch: #{yaml_value(repository[:branch])}",
+      repository[:tags] && "      tags: #{yaml_value(repository[:tags])}"
+    ]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, timeout_ms) do
+    if Enum.all?([hook_after_create, hook_before_run, hook_after_run, hook_before_remove], &is_nil/1) do
+      "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
+    else
+      [
+        "hooks:",
+        "  timeout_ms: #{yaml_value(timeout_ms)}",
+        hook_entry("after_create", hook_after_create),
+        hook_entry("before_run", hook_before_run),
+        hook_entry("after_run", hook_after_run),
+        hook_entry("before_remove", hook_before_remove)
+      ]
+      |> Enum.reject(&is_nil/1)
+      |> Enum.join("\n")
+    end
+  end
+
+  defp memory_yaml(enabled, command, verify_evidence, install_during_init) do
+    [
+      "memory:",
+      "  total_recall:",
+      "    enabled: #{yaml_value(enabled)}",
+      "    command: #{yaml_value(command)}",
+      "    verify_evidence: #{yaml_value(verify_evidence)}",
+      "    install_during_init: #{yaml_value(install_during_init)}"
+    ]
     |> Enum.join("\n")
   end
 

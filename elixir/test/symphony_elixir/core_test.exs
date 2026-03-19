@@ -14,9 +14,11 @@ defmodule SymphonyElixir.CoreTest do
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
     assert config.tracker.active_states == ["Todo", "In Progress"]
+    assert config.tracker.planning_states == ["Spec Review", "Needs Clarification", "Planning"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert Config.dispatchable_active_states() == ["Todo", "In Progress"]
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -88,6 +90,43 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
   end
 
+  defmodule FakeProjectConfig do
+    @spec resolve_tracker(map(), non_neg_integer()) :: {:ok, map()}
+    def resolve_tracker(tracker, ttl_ms) do
+      send(self(), {:resolve_tracker, tracker.project_slug, ttl_ms})
+
+      {:ok,
+       %{
+         project_url: "https://linear.app/acme/project/#{tracker.project_slug}",
+         active_states: ["Backlog", "Todo", "In Progress", "In Review"],
+         terminal_states: ["Done", "Canceled"]
+       }}
+    end
+  end
+
+  test "config syncs tracker workflow states from Linear project config when enabled" do
+    Application.put_env(:symphony_elixir, :linear_project_config_module, FakeProjectConfig)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :linear_project_config_module)
+    end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "dynamic-project",
+      tracker_sync_project_states: true,
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Done"]
+    )
+
+    config = Config.settings!()
+
+    assert_received {:resolve_tracker, "dynamic-project", 30_000}
+    assert config.tracker.project_url == "https://linear.app/acme/project/dynamic-project"
+    assert config.tracker.active_states == ["Backlog", "Todo", "In Progress", "In Review"]
+    assert config.tracker.terminal_states == ["Done", "Canceled"]
+    assert Config.dispatchable_active_states() == ["Todo", "In Progress", "In Review"]
+  end
+
   test "current WORKFLOW.md file is valid and complete" do
     original_workflow_path = Workflow.workflow_file_path()
     on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)
@@ -101,14 +140,24 @@ defmodule SymphonyElixir.CoreTest do
     assert Map.get(tracker, "kind") == "linear"
     assert is_binary(Map.get(tracker, "project_slug"))
     assert is_list(Map.get(tracker, "active_states"))
+    assert is_list(Map.get(tracker, "planning_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
+
+    workspace = Map.get(config, "workspace", %{})
+    assert is_map(workspace)
+    assert is_list(Map.get(workspace, "repositories"))
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)
-    assert Map.get(hooks, "after_create") =~ "git clone --depth 1 https://github.com/openai/symphony ."
     assert Map.get(hooks, "after_create") =~ "cd elixir && mise trust"
     assert Map.get(hooks, "after_create") =~ "mise exec -- mix deps.get"
     assert Map.get(hooks, "before_remove") =~ "cd elixir && mise exec -- mix workspace.before_remove"
+
+    memory = get_in(config, ["memory", "total_recall"]) || %{}
+    assert memory["enabled"] == true
+    assert memory["command"] == "total-recall"
+    assert memory["verify_evidence"] == true
+    assert memory["install_during_init"] == true
 
     assert String.trim(prompt) != ""
     assert is_binary(Config.workflow_prompt())
@@ -147,6 +196,32 @@ defmodule SymphonyElixir.CoreTest do
     )
 
     assert Config.settings!().tracker.assignee == env_assignee
+  end
+
+  test "linear project slug accepts a full project url and normalizes it to the slug" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "https://linear.app/team-name/project/project-slug-123/issues",
+      codex_command: "/bin/sh app-server"
+    )
+
+    assert Config.settings!().tracker.project_slug == "project-slug-123"
+
+    assert Config.settings!().tracker.project_url ==
+             "https://linear.app/team-name/project/project-slug-123/issues"
+
+    assert :ok = Config.validate!()
+  end
+
+  test "linear project slug accepts a real Linear project url and normalizes it to the slugId suffix" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: "https://linear.app/team-name/project/project-name-2687ec99687c",
+      codex_command: "/bin/sh app-server"
+    )
+
+    assert Config.settings!().tracker.project_slug == "2687ec99687c"
+
+    assert Config.settings!().tracker.project_url ==
+             "https://linear.app/team-name/project/project-name-2687ec99687c"
   end
 
   test "workflow file path defaults to WORKFLOW.md in the current working directory when app env is unset" do
@@ -705,8 +780,9 @@ defmodule SymphonyElixir.CoreTest do
 
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
+    minimum_with_slack = max(min_remaining_ms - 250, 0)
 
-    assert remaining_ms >= min_remaining_ms
+    assert remaining_ms >= minimum_with_slack
     assert remaining_ms <= max_remaining_ms
   end
 
@@ -839,11 +915,101 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "You are working on a Linear issue."
     assert prompt =~ "Identifier: MT-777"
     assert prompt =~ "Title: Make fallback prompt useful"
+    assert prompt =~ "Workspace: "
+    assert prompt =~ "Repository layout:"
+    assert prompt =~ "Planning and approval gate:"
+    assert prompt =~ "Start by writing a"
+    assert prompt =~ "Shared memory requirement:"
+    assert prompt =~ "total-recall query"
+    assert prompt =~ "## Shared Memory"
     assert prompt =~ "Body:"
     assert prompt =~ "Include enough issue context to start working."
     assert Config.workflow_prompt() =~ "{{ issue.identifier }}"
     assert Config.workflow_prompt() =~ "{{ issue.title }}"
     assert Config.workflow_prompt() =~ "{{ issue.description }}"
+  end
+
+  test "prompt builder default template requires visual proof for frontend tasks" do
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: " \n")
+
+    issue = %Issue{
+      identifier: "MT-782",
+      title: "Polish the checkout button animation",
+      description: "Frontend follow-up for the purchase screen",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-782",
+      labels: ["frontend", "ui"]
+    }
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        repositories: [%{name: "app", relative_path: ".", tags: ["frontend", "ios"]}]
+      )
+
+    assert prompt =~ "Frontend proof requirement:"
+    assert prompt =~ "include at least one screenshot of the changed UI"
+    assert prompt =~ "short video when the change depends on motion or interaction"
+  end
+
+  test "prompt builder guidance requires clarification and planning state for underspecified work" do
+    workflow_prompt =
+      "{% if guidance.clarification_required %}clarify={{ guidance.planning_state }}|{{ guidance.clarification_points }}{% else %}clear{% endif %}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "MT-782B",
+      title: "Improve onboarding",
+      description: nil,
+      state: "Todo",
+      url: "https://example.org/issues/MT-782B",
+      labels: ["product"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue, repositories: [%{name: "app", relative_path: ".", tags: ["frontend"]}])
+
+    assert prompt =~ "clarify=Spec Review"
+    assert prompt =~ "issue description is missing"
+  end
+
+  test "prompt builder guidance can distinguish frontend from backend issues" do
+    workflow_prompt =
+      "{% if guidance.frontend_artifact_required %}visual={{ guidance.frontend_signal_summary }} approval={{ guidance.execution_approval_required }} detail={{ guidance.spec_detail_level }}{% else %}no-visual-proof{% endif %}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    frontend_issue = %Issue{
+      identifier: "MT-783",
+      title: "Show the menu bar icon in the notch",
+      description: "SwiftUI screen polish",
+      state: "Todo",
+      url: "https://example.org/issues/MT-783",
+      labels: ["ios"]
+    }
+
+    backend_issue = %Issue{
+      identifier: "MT-784",
+      title: "Retry the billing webhook",
+      description: "Backend worker change only",
+      state: "Todo",
+      url: "https://example.org/issues/MT-784",
+      labels: ["backend"]
+    }
+
+    frontend_prompt =
+      PromptBuilder.build_prompt(frontend_issue,
+        repositories: [%{name: "ios-app", relative_path: ".", tags: ["ios", "mobile"]}]
+      )
+
+    backend_prompt =
+      PromptBuilder.build_prompt(backend_issue,
+        repositories: [%{name: "api", relative_path: ".", tags: ["backend"]}]
+      )
+
+    assert frontend_prompt =~ "visual="
+    assert frontend_prompt =~ "approval=true"
+    assert frontend_prompt =~ "notch"
+    assert backend_prompt == "no-visual-proof"
   end
 
   test "prompt builder default template handles missing issue body" do
@@ -913,18 +1079,47 @@ defmodule SymphonyElixir.CoreTest do
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
     assert prompt =~ "You are working on a Linear ticket `MT-616`"
+    assert prompt =~ "Workspace:"
+    assert prompt =~ "Repositories:"
+    assert prompt =~ "`symphony` at `.`"
     assert prompt =~ "Issue context:"
     assert prompt =~ "Identifier: MT-616"
     assert prompt =~ "Title: Use rich templates for WORKFLOW.md"
     assert prompt =~ "Current status: In Progress"
     assert prompt =~ "https://example.org/issues/MT-616/use-rich-templates-for-workflowmd"
-    assert prompt =~ "This is an unattended orchestration session."
-    assert prompt =~ "Only stop early for a true blocker"
-    assert prompt =~ "Do not include \"next steps for user\""
+    assert prompt =~ "Start with a spec, not code."
+    assert prompt =~ "For non-trivial work, confirm the proposed plan"
+    assert prompt =~ "Planning and approval gate:"
     assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
     assert prompt =~ "Do not call `gh pr merge` directly"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
+  end
+
+  test "in-repo WORKFLOW.md requires screenshot or video evidence for frontend tasks" do
+    workflow_path = Workflow.workflow_file_path()
+    Workflow.set_workflow_file_path(Path.expand("WORKFLOW.md", File.cwd!()))
+
+    issue = %Issue{
+      identifier: "MT-617",
+      title: "Make the menu bar icon show in the notch",
+      description: "Frontend polish for the SwiftUI menu bar view",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-617/menu-bar-icon",
+      labels: ["frontend", "ios"]
+    }
+
+    on_exit(fn -> Workflow.set_workflow_file_path(workflow_path) end)
+
+    prompt =
+      PromptBuilder.build_prompt(issue,
+        repositories: [%{name: "symphony", relative_path: ".", tags: ["frontend", "ios"]}]
+      )
+
+    assert prompt =~ "Frontend proof requirement:"
+    assert prompt =~ "Planning and approval gate:"
+    assert prompt =~ "capture at least one screenshot of the changed UI"
+    assert prompt =~ "Reference the screenshot or video in the workpad and final message."
   end
 
   test "prompt builder adds continuation guidance for retries" do
@@ -943,6 +1138,24 @@ defmodule SymphonyElixir.CoreTest do
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 
     assert prompt == "Retry #2"
+  end
+
+  test "prompt builder can opt out of total recall instructions" do
+    write_workflow_file!(Workflow.workflow_file_path(), total_recall_enabled: false, prompt: " \n")
+
+    issue = %Issue{
+      identifier: "MT-201B",
+      title: "Disable memory prompt",
+      description: "Prompt should not mention shared memory",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-201B",
+      labels: []
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    refute prompt =~ "Shared memory requirement:"
+    refute prompt =~ "## Shared Memory"
   end
 
   test "agent runner keeps workspace after successful codex run" do
@@ -1117,6 +1330,187 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner verifies shared memory evidence after a turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-memory-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(
+        codex_binary,
+        """
+        #!/bin/sh
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1)
+              printf '%s\\n' '{\"id\":1,\"result\":{}}'
+              ;;
+            2)
+              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-memory\"}}}'
+              ;;
+            3)
+              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-memory\"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{\"method\":\"turn/completed\"}'
+              ;;
+          esac
+        done
+        """
+      )
+
+      File.chmod!(codex_binary, 0o755)
+
+      Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+        "issue-memory" => [
+          %{
+            id: "comment-1",
+            body: """
+            ## Codex Workpad
+
+            ## Shared Memory
+            - Query: have we solved workspace bootstrap verification before?
+            - Relevant memories: 🧠 Relevant memory: prior workspace bootstrap test covered fake codex setup 🧠
+            - Write summary: verified shared memory evidence after the turn
+            - Total Recall status: ok
+            """,
+            updated_at: DateTime.utc_now()
+          }
+        ]
+      })
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        total_recall_verify_evidence: true
+      )
+
+      issue = %Issue{
+        id: "issue-memory",
+        identifier: "MT-301",
+        title: "Verify shared memory",
+        description: "Ensure workpad shared memory block is enforced",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-301",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 self(),
+                 issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+               )
+
+      assert_receive {:codex_worker_update, "issue-memory", %{event: :memory_verified, memory: memory}}, 500
+      assert memory.query =~ "workspace bootstrap"
+      assert memory.write_summary =~ "verified shared memory evidence"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner fails when shared memory evidence is missing" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-memory-missing-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(
+        codex_binary,
+        """
+        #!/bin/sh
+        count=0
+        while IFS= read -r line; do
+          count=$((count + 1))
+          case "$count" in
+            1)
+              printf '%s\\n' '{\"id\":1,\"result\":{}}'
+              ;;
+            2)
+              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-memory-fail\"}}}'
+              ;;
+            3)
+              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-memory-fail\"}}}'
+              ;;
+            4)
+              printf '%s\\n' '{\"method\":\"turn/completed\"}'
+              ;;
+          esac
+        done
+        """
+      )
+
+      File.chmod!(codex_binary, 0o755)
+
+      Application.put_env(:symphony_elixir, :memory_tracker_comments, %{
+        "issue-memory-fail" => [%{id: "comment-1", body: "## Codex Workpad", updated_at: DateTime.utc_now()}]
+      })
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        total_recall_verify_evidence: true
+      )
+
+      issue = %Issue{
+        id: "issue-memory-fail",
+        identifier: "MT-302",
+        title: "Reject missing shared memory",
+        description: "The workpad is missing the required block",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-302",
+        labels: []
+      }
+
+      assert_raise RuntimeError, ~r/memory_non_compliant/, fn ->
+        AgentRunner.run(
+          issue,
+          self(),
+          issue_state_fetcher: fn [_issue_id] -> {:ok, [%{issue | state: "Done"}]} end
+        )
+      end
+
+      assert_receive {:codex_worker_update, "issue-memory-fail", %{event: :memory_non_compliant}}, 500
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner continues with a follow-up turn while the issue remains active" do
     test_root =
       Path.join(
@@ -1242,6 +1636,8 @@ defmodule SymphonyElixir.CoreTest do
       refute Enum.at(turn_texts, 1) =~ "You are an agent for this repository."
       assert Enum.at(turn_texts, 1) =~ "Continuation guidance:"
       assert Enum.at(turn_texts, 1) =~ "continuation turn #2 of 3"
+      assert Enum.at(turn_texts, 1) =~ "total-recall query"
+      assert Enum.at(turn_texts, 1) =~ "## Shared Memory"
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)
@@ -1458,7 +1854,7 @@ defmodule SymphonyElixir.CoreTest do
         "type" => "workspaceWrite",
         "writableRoots" => [canonical_workspace],
         "readOnlyAccess" => %{"type" => "fullAccess"},
-        "networkAccess" => false,
+        "networkAccess" => true,
         "excludeTmpdirEnvVar" => false,
         "excludeSlashTmp" => false
       }

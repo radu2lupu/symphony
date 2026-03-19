@@ -2,6 +2,11 @@
 tracker:
   kind: linear
   project_slug: "symphony-0c79b11b75ea"
+  sync_project_states: true
+  planning_states:
+    - Spec Review
+    - Needs Clarification
+    - Planning
   active_states:
     - Todo
     - In Progress
@@ -17,9 +22,13 @@ polling:
   interval_ms: 5000
 workspace:
   root: ~/code/symphony-workspaces
+  registry_path: .symphony/repos.json
+  repositories:
+    - name: symphony
+      source: https://github.com/openai/symphony
+      path: .
 hooks:
   after_create: |
-    git clone --depth 1 https://github.com/openai/symphony .
     if command -v mise >/dev/null 2>&1; then
       cd elixir && mise trust && mise exec -- mix deps.get
     fi
@@ -34,6 +43,13 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+    networkAccess: true
+memory:
+  total_recall:
+    enabled: true
+    command: "total-recall"
+    verify_evidence: true
+    install_during_init: true
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
@@ -63,11 +79,75 @@ No description provided.
 
 Instructions:
 
-1. This is an unattended orchestration session. Never ask a human to perform follow-up actions.
-2. Only stop early for a true blocker (missing required auth/permissions/secrets). If blocked, record it in the workpad and move the issue according to workflow.
-3. Final message must report completed actions and blockers only. Do not include "next steps for user".
+1. Start with a spec, not code. Do not begin implementation until the ask is clear enough to make informed decisions.
+2. Ask focused clarification questions when requirements, acceptance criteria, or tradeoffs are underspecified. Do not assume missing product or UX decisions.
+3. For non-trivial work, confirm the proposed plan and wait for explicit go-ahead before implementation. Use the planning state flow below instead of coding ahead.
+4. Final message must report completed actions and blockers only. Do not include "next steps for user".
 
-Work only in the provided repository copy. Do not touch any other path.
+Workspace: `{{ workspace.path }}`
+Repositories:
+{% for repository in workspace.repositories %}
+- `{{ repository.name }}` at `{{ repository.relative_path }}`
+{% endfor %}
+
+Planning and approval gate:
+
+- Start by writing a {{ guidance.spec_detail_level }} spec in the workpad before code edits.
+- Minimal spec: problem statement, chosen repo, acceptance criteria, and validation plan.
+- Standard spec: minimal spec plus scope/non-goals, implementation outline, risks, and open questions.
+- Detailed spec: standard spec plus repo-by-repo impact, user flow/API contract notes, tradeoffs, and rollout/validation matrix.
+{% if guidance.clarification_required %}
+- Clarification is required before implementation:
+{% for point in guidance.clarification_points %}
+  - {{ point }}
+{% endfor %}
+- Ask focused questions, move the ticket to `{{ guidance.planning_state }}` if available, and stop without editing code.
+{% elsif guidance.execution_approval_required %}
+- After writing the spec, ask for explicit go-ahead before implementation.
+- Move the ticket to `{{ guidance.planning_state }}` while waiting if that state exists.
+- Do not edit code until the issue comments or description contain explicit approval of the plan.
+{% else %}
+- If the ask is already explicit and low-risk, proceed after recording the plan in the workpad.
+{% endif %}
+
+{% if guidance.frontend_artifact_required %}
+Frontend proof requirement:
+
+- This ticket appears user-facing from the issue context or repo signals.
+- Before handoff, capture at least one screenshot of the changed UI, or a short video when motion or interaction is the important part.
+- Reference the screenshot or video in the workpad and final message.
+- If visual capture is unavailable, treat that as a blocker and explain exactly what prevented it.
+
+{% endif %}
+
+{% if memory.total_recall.enabled %}
+Shared memory requirement:
+
+- Before starting new work, run `{{ memory.total_recall.command }} query "<semantic query>"` using a high-level question such as "have we solved X before?" or "how do we usually do Y here?".
+- Do not use the raw ticket text as the query; author the query yourself based on the task.
+- When retrieved memory materially informs the task, reference it as `🧠 Relevant memory: ... 🧠`.
+- Maintain this exact block in the `## Codex Workpad` comment and keep it current for the active turn:
+  - `## Shared Memory`
+  - `- Query: <semantic query used this turn>`
+  - `- Relevant memories: <none | short refs>`
+  - `- Write summary: <what changed, why, what future agents should reuse/avoid>`
+  - `- Total Recall status: ok | unavailable: <reason>`
+- After each completed turn and again when the run is wrapping up, persist a short structured summary with `{{ memory.total_recall.command }} write "<what changed, why, what future agents should reuse or avoid>"`.
+{% if memory.total_recall.verify_evidence %}
+- Symphony will verify the `## Shared Memory` block after each turn. Missing or malformed evidence fails the turn. If Total Recall is unavailable, record `Total Recall status: unavailable: <reason>` and continue.
+{% endif %}
+
+{% endif %}
+
+Work only in the provided workspace and its configured repository copies. Do not touch any other path.
+
+Repository routing conventions:
+
+- If the issue has a label like `repo:<name>`, treat that as the explicit target repo.
+- Otherwise, use repo-tag labels and issue context to decide which repo to edit.
+- A ticket titled `Register repo: <name>` or labeled `symphony:register-repo` is a control ticket:
+  parse the YAML payload, persist the repo in the local registry, comment with the registration
+  result, and move the ticket to `Done` without starting Codex implementation work.
 
 ## Prerequisite: Linear MCP or `linear_graphql` tool is available
 
@@ -104,9 +184,9 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 ## Status map
 
 - `Backlog` -> out of scope for this workflow; do not modify.
-- `Todo` -> queued; immediately transition to `In Progress` before active work.
-  - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
-- `In Progress` -> implementation actively underway.
+- `Todo` -> queued; start the planning/spec flow, not implementation.
+- `Spec Review` / `Needs Clarification` / `Planning` -> waiting for clarified requirements or explicit approval of the proposed spec.
+- `In Progress` -> implementation actively underway after the spec is approved.
 - `Human Review` -> PR is attached and validated; waiting on human approval.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
@@ -118,8 +198,9 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 2. Read the current state.
 3. Route to the matching flow:
    - `Backlog` -> do not modify issue content/state; stop and wait for human to move it to `Todo`.
-   - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
+   - `Todo` -> ensure bootstrap workpad comment exists (create if missing), write/update the scoped spec, and decide whether the ticket needs clarification, approval, or can move to `In Progress`.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
+   - `Spec Review` / `Needs Clarification` / `Planning` -> wait for human answers or explicit approval; do not code while the ticket is in a planning state.
    - `In Progress` -> continue execution flow from current scratchpad comment.
    - `Human Review` -> wait and poll for decision/review updates.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
@@ -129,9 +210,10 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - If a branch PR exists and is `CLOSED` or `MERGED`, treat prior branch work as non-reusable for this run.
    - Create a fresh branch from `origin/main` and restart execution flow as a new attempt.
 5. For `Todo` tickets, do startup sequencing in this exact order:
-   - `update_issue(..., state: "In Progress")`
    - find/create `## Codex Workpad` bootstrap comment
-   - only then begin analysis/planning/implementation work.
+   - write/update the scoped spec and explicit acceptance criteria
+   - if clarification or approval is needed, move to the best matching planning state and stop
+   - only move to `In Progress` once the spec is explicit and approved for implementation
 6. Add a short comment if state and issue content are inconsistent, then proceed with the safest flow.
 
 ## Step 1: Start/continue execution (Todo or In Progress)
@@ -142,7 +224,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
     - If found, reuse that comment; do not create a new workpad comment.
     - If not found, create one workpad comment and use it for all updates.
     - Persist the workpad comment ID and only write progress updates to that ID.
-2.  If arriving from `Todo`, do not delay on additional status transitions: the issue should already be `In Progress` before this step begins.
+2.  If arriving from `Todo`, finish the scoped spec first. Only transition to `In Progress` after clarification questions are resolved and the plan has explicit approval when required.
 3.  Immediately reconcile the workpad before new edits:
     - Check off items that are already done.
     - Expand/fix the plan so it is comprehensive for current scope.
@@ -212,6 +294,7 @@ Use this only when completion is blocked by missing required tools or missing au
     - You may make temporary local proof edits to validate assumptions (for example: tweak a local build input for `make`, or hardcode a UI account / response path) when this increases confidence.
     - Revert every temporary proof edit before commit/push.
     - Document these temporary proof steps and outcomes in the workpad `Validation`/`Notes` sections so reviewers can follow the evidence.
+    - If `guidance.frontend_artifact_required` applies, capture/upload at least one screenshot or short video as validation evidence before handoff.
     - If app-touching, run `launch-app` validation and capture/upload media via `github-pr-media` before handoff.
 6.  Re-check all acceptance criteria and close any gaps.
 7.  Before every `git push` attempt, run the required validation for your scope and confirm it passes; if it fails, address issues and rerun until green, then commit and push changes.

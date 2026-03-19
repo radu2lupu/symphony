@@ -49,8 +49,11 @@ defmodule SymphonyElixir.Config.Schema do
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
       field(:project_slug, :string)
+      field(:project_url, :string)
+      field(:sync_project_states, :boolean, default: true)
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
+      field(:planning_states, {:array, :string}, default: ["Spec Review", "Needs Clarification", "Planning"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
 
@@ -59,7 +62,7 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [:kind, :endpoint, :api_key, :project_slug, :project_url, :sync_project_states, :assignee, :active_states, :planning_states, :terminal_states],
         empty_values: []
       )
     end
@@ -88,15 +91,72 @@ defmodule SymphonyElixir.Config.Schema do
     use Ecto.Schema
     import Ecto.Changeset
 
+    defmodule Repository do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:name, :string)
+        field(:source, :string)
+        field(:path, :string)
+        field(:branch, :string)
+        field(:tags, {:array, :string}, default: [])
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:name, :source, :path, :branch, :tags], empty_values: [])
+        |> validate_required([:name, :source])
+        |> validate_change(:name, &validate_non_blank_string/2)
+        |> validate_change(:source, &validate_non_blank_string/2)
+        |> validate_change(:path, &validate_relative_repository_path/2)
+      end
+
+      defp validate_non_blank_string(field, value) when is_binary(value) do
+        if String.trim(value) == "" do
+          [{field, "must not be blank"}]
+        else
+          []
+        end
+      end
+
+      defp validate_non_blank_string(_field, _value), do: []
+
+      defp validate_relative_repository_path(_field, value) when value in [nil, ""], do: []
+
+      defp validate_relative_repository_path(field, value) when is_binary(value) do
+        expanded = Path.expand(value, "/workspace")
+
+        cond do
+          Path.type(value) == :absolute ->
+            [{field, "must stay inside the issue workspace"}]
+
+          expanded != "/workspace" and not String.starts_with?(expanded <> "/", "/workspace/") ->
+            [{field, "must stay inside the issue workspace"}]
+
+          true ->
+            []
+        end
+      end
+
+      defp validate_relative_repository_path(_field, _value), do: []
+    end
+
     @primary_key false
     embedded_schema do
       field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:registry_path, :string)
+      embeds_many(:repositories, Repository, on_replace: :delete)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:root], empty_values: [])
+      |> cast(attrs, [:root, :registry_path], empty_values: [])
+      |> cast_embed(:repositories, with: &Repository.changeset/2)
     end
   end
 
@@ -202,6 +262,56 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Memory do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    defmodule TotalRecall do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:enabled, :boolean, default: true)
+        field(:command, :string, default: "total-recall")
+        field(:verify_evidence, :boolean, default: true)
+        field(:install_during_init, :boolean, default: true)
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:enabled, :command, :verify_evidence, :install_during_init], empty_values: [])
+        |> validate_required([:command])
+        |> validate_change(:command, &validate_non_blank_string/2)
+      end
+
+      defp validate_non_blank_string(field, value) when is_binary(value) do
+        if String.trim(value) == "" do
+          [{field, "must not be blank"}]
+        else
+          []
+        end
+      end
+
+      defp validate_non_blank_string(_field, _value), do: []
+    end
+
+    @primary_key false
+    embedded_schema do
+      embeds_one(:total_recall, TotalRecall, on_replace: :update, defaults_to_struct: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [])
+      |> cast_embed(:total_recall, with: &TotalRecall.changeset/2)
+    end
+  end
+
   defmodule Observability do
     @moduledoc false
     use Ecto.Schema
@@ -249,6 +359,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:memory, Memory, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
   end
@@ -335,20 +446,32 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
+    |> cast_embed(:memory, with: &Memory.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
   end
 
   defp finalize_settings(settings) do
+    tracker_project = resolve_tracker_project(settings.tracker.project_slug, settings.tracker.project_url)
+
     tracker = %{
       settings.tracker
       | api_key: resolve_secret_setting(settings.tracker.api_key, System.get_env("LINEAR_API_KEY")),
-        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE"))
+        assignee: resolve_secret_setting(settings.tracker.assignee, System.get_env("LINEAR_ASSIGNEE")),
+        project_slug: tracker_project.slug,
+        project_url: tracker_project.url
     }
 
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces")),
+        registry_path:
+          resolve_registry_path(
+            settings.workspace.registry_path,
+            settings.workspace.root,
+            Path.join(Path.join(System.tmp_dir!(), "symphony_workspaces"), ".symphony_repo_registry.json")
+          ),
+        repositories: finalize_workspace_repositories(settings.workspace.repositories || [])
     }
 
     codex = %{
@@ -453,6 +576,145 @@ defmodule SymphonyElixir.Config.Schema do
 
   defp normalize_secret_value(_value), do: nil
 
+  defp resolve_tracker_project(project_slug_value, project_url_value) do
+    project_slug =
+      case project_slug_value do
+        value when is_binary(value) ->
+          value
+          |> resolve_env_value(nil)
+          |> normalize_repository_string()
+
+        _ ->
+          nil
+      end
+
+    project_url =
+      case project_url_value do
+        value when is_binary(value) ->
+          value
+          |> resolve_env_value(nil)
+          |> normalize_repository_string()
+
+        _ ->
+          nil
+      end
+
+    cond do
+      is_binary(project_url) ->
+        %{
+          slug: extract_linear_project_slug(project_url) || project_slug,
+          url: project_url
+        }
+
+      is_binary(project_slug) and String.contains?(project_slug, "/project/") ->
+        %{
+          slug: extract_linear_project_slug(project_slug),
+          url: project_slug
+        }
+
+      true ->
+        %{slug: project_slug, url: nil}
+    end
+  end
+
+  defp extract_linear_project_slug(value) when is_binary(value) do
+    case Regex.run(~r{/project/([^/?#]+)}, value) do
+      [_, project_slug] -> extract_linear_project_slug_id(project_slug)
+      _ -> nil
+    end
+  end
+
+  defp extract_linear_project_slug_id(project_slug) when is_binary(project_slug) do
+    case Regex.run(~r/-([a-f0-9]{8,})$/i, project_slug) do
+      [_, slug_id] -> slug_id
+      _ -> project_slug
+    end
+  end
+
+  defp finalize_workspace_repositories(repositories) when is_list(repositories) do
+    Enum.map(repositories, fn repository ->
+      %{
+        repository
+        | source: resolve_repository_source(repository.source),
+          path: resolve_repository_path(repository.path),
+          branch: resolve_repository_string(repository.branch),
+          tags: finalize_repository_tags(repository.tags || [])
+      }
+    end)
+  end
+
+  defp resolve_repository_source(value) when is_binary(value) do
+    value
+    |> resolve_env_value(nil)
+    |> normalize_repository_string()
+    |> maybe_expand_local_repository_source()
+  end
+
+  defp resolve_repository_source(_value), do: nil
+
+  defp resolve_repository_path(value) when is_binary(value) do
+    value
+    |> resolve_env_value(nil)
+    |> normalize_repository_string()
+  end
+
+  defp resolve_repository_path(_value), do: nil
+
+  defp resolve_repository_string(value) when is_binary(value) do
+    value
+    |> resolve_env_value(nil)
+    |> normalize_repository_string()
+  end
+
+  defp resolve_repository_string(_value), do: nil
+
+  defp finalize_repository_tags(tags) when is_list(tags) do
+    tags
+    |> Enum.map(&normalize_repository_string/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp finalize_repository_tags(_tags), do: []
+
+  defp normalize_repository_string(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp normalize_repository_string(_value), do: nil
+
+  defp maybe_expand_local_repository_source(nil), do: nil
+
+  defp maybe_expand_local_repository_source(value) when is_binary(value) do
+    if String.starts_with?(value, ["~", ".", "/"]) do
+      Path.expand(value)
+    else
+      value
+    end
+  end
+
+  defp resolve_registry_path(value, workspace_root, default) when is_binary(value) do
+    case value |> resolve_env_value(nil) |> normalize_repository_string() do
+      nil ->
+        resolve_registry_path(nil, workspace_root, default)
+
+      path ->
+        if Path.type(path) == :absolute do
+          Path.expand(path)
+        else
+          Path.expand(
+            path,
+            resolve_path_value(workspace_root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+          )
+        end
+    end
+  end
+
+  defp resolve_registry_path(_value, workspace_root, default) do
+    resolve_registry_path(default, workspace_root, default)
+  end
+
   defp default_turn_sandbox_policy(workspace) do
     writable_root =
       if is_binary(workspace) and workspace != "" do
@@ -465,7 +727,7 @@ defmodule SymphonyElixir.Config.Schema do
       "type" => "workspaceWrite",
       "writableRoots" => [writable_root],
       "readOnlyAccess" => %{"type" => "fullAccess"},
-      "networkAccess" => false,
+      "networkAccess" => true,
       "excludeTmpdirEnvVar" => false,
       "excludeSlashTmp" => false
     }

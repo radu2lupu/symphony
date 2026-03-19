@@ -622,7 +622,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp active_state_set do
-    Config.settings!().tracker.active_states
+    Config.dispatchable_active_states()
     |> Enum.map(&normalize_issue_state/1)
     |> Enum.filter(&(&1 != ""))
     |> MapSet.new()
@@ -678,7 +678,11 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: DateTime.utc_now(),
+            total_recall_status: nil,
+            total_recall_query: nil,
+            total_recall_relevant_memories: nil,
+            total_recall_write_summary: nil
           })
 
         %{
@@ -992,6 +996,10 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
+          total_recall_status: Map.get(metadata, :total_recall_status),
+          total_recall_query: Map.get(metadata, :total_recall_query),
+          total_recall_relevant_memories: Map.get(metadata, :total_recall_relevant_memories),
+          total_recall_write_summary: Map.get(metadata, :total_recall_write_summary),
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
       end)
@@ -1049,7 +1057,8 @@ defmodule SymphonyElixir.Orchestrator do
     turn_count = Map.get(running_entry, :turn_count, 0)
 
     {
-      Map.merge(running_entry, %{
+      running_entry
+      |> Map.merge(%{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
@@ -1062,10 +1071,22 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
+      })
+      |> merge_memory_update(update),
       token_delta
     }
   end
+
+  defp merge_memory_update(running_entry, %{memory: %{} = memory}) do
+    Map.merge(running_entry, %{
+      total_recall_status: memory_status_text(memory),
+      total_recall_query: Map.get(memory, :query),
+      total_recall_relevant_memories: Map.get(memory, :relevant_memories),
+      total_recall_write_summary: Map.get(memory, :write_summary)
+    })
+  end
+
+  defp merge_memory_update(running_entry, _update), do: running_entry
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),
@@ -1110,6 +1131,11 @@ defmodule SymphonyElixir.Orchestrator do
       timestamp: update[:timestamp]
     }
   end
+
+  defp memory_status_text(%{status: {:ok, status}}) when is_binary(status), do: status
+  defp memory_status_text(%{status: {:unavailable, reason}}) when is_binary(reason), do: "unavailable: #{reason}"
+  defp memory_status_text(%{status: {:error, reason}}) when is_binary(reason), do: "error: #{reason}"
+  defp memory_status_text(_memory), do: nil
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     if is_reference(state.tick_timer_ref) do

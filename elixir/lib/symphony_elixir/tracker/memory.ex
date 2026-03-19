@@ -35,8 +35,14 @@ defmodule SymphonyElixir.Tracker.Memory do
      end)}
   end
 
+  @spec fetch_comments(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_comments(issue_id) when is_binary(issue_id) do
+    {:ok, Map.get(Application.get_env(:symphony_elixir, :memory_tracker_comments, %{}), issue_id, [])}
+  end
+
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) do
+    append_comment(issue_id, body)
     send_event({:memory_tracker_comment, issue_id, body})
     :ok
   end
@@ -50,6 +56,15 @@ defmodule SymphonyElixir.Tracker.Memory do
   defp configured_issues do
     Application.get_env(:symphony_elixir, :memory_tracker_issues, [])
   end
+
+  defp append_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
+    comments = Application.get_env(:symphony_elixir, :memory_tracker_comments, %{})
+    issue_comments = Map.get(comments, issue_id, [])
+    comment = %{id: "comment-#{System.unique_integer([:positive])}", body: body, updated_at: DateTime.utc_now()}
+    Application.put_env(:symphony_elixir, :memory_tracker_comments, Map.put(comments, issue_id, issue_comments ++ [comment]))
+  end
+
+  defp append_comment(_issue_id, _body), do: :ok
 
   defp issue_entries do
     Enum.filter(configured_issues(), &match?(%Issue{}, &1))

@@ -4,20 +4,25 @@ defmodule SymphonyElixir.Workspace do
   """
 
   require Logger
-  alias SymphonyElixir.{Config, PathSafety}
+  alias SymphonyElixir.{Config, PathSafety, RepoManager}
 
   @excluded_entries MapSet.new([".elixir_ls", "tmp"])
+
+  @spec path_for_issue(map() | String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
+  def path_for_issue(issue_or_identifier) do
+    issue_context = issue_context(issue_or_identifier)
+    workspace_path_for_issue(safe_identifier(issue_context.issue_identifier))
+  end
 
   @spec create_for_issue(map() | String.t() | nil) :: {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
-      safe_id = safe_identifier(issue_context.issue_identifier)
-
-      with {:ok, workspace} <- workspace_path_for_issue(safe_id),
+      with {:ok, workspace} <- path_for_issue(issue_context),
            :ok <- validate_workspace_path(workspace),
            {:ok, created?} <- ensure_workspace(workspace),
+           :ok <- maybe_populate_repositories(workspace, issue_context, created?),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?) do
         {:ok, workspace}
       end
@@ -146,6 +151,88 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  defp maybe_populate_repositories(_workspace, _issue_context, false), do: :ok
+
+  defp maybe_populate_repositories(workspace, issue_context, true) do
+    issue_context
+    |> issue_from_context()
+    |> RepoManager.routed_repositories(workspace)
+    |> Enum.reduce_while(:ok, fn repository, :ok ->
+      case clone_repository(workspace, repository, issue_context) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp clone_repository(workspace, repository, issue_context) do
+    destination = repository_destination_path(workspace, repository.relative_path)
+
+    with :ok <- validate_repository_destination(workspace, destination),
+         :ok <- ensure_destination_parent(destination),
+         {:ok, git} <- git_executable(),
+         :ok <- run_repository_clone(git, workspace, destination, repository, issue_context) do
+      :ok
+    end
+  end
+
+  defp repository_destination_path(workspace, "."), do: workspace
+  defp repository_destination_path(workspace, relative_path), do: Path.expand(relative_path, workspace)
+
+  defp validate_repository_destination(workspace, destination) do
+    workspace_prefix = workspace <> "/"
+
+    cond do
+      destination == workspace ->
+        :ok
+
+      String.starts_with?(destination <> "/", workspace_prefix) ->
+        :ok
+
+      true ->
+        {:error, {:workspace_repository_outside_root, destination, workspace}}
+    end
+  end
+
+  defp ensure_destination_parent(destination) do
+    destination
+    |> Path.dirname()
+    |> File.mkdir_p()
+  end
+
+  defp git_executable do
+    case System.find_executable("git") do
+      nil -> {:error, :git_not_found}
+      executable -> {:ok, executable}
+    end
+  end
+
+  defp run_repository_clone(git, workspace, destination, repository, issue_context) do
+    args =
+      ["clone", "--depth", "1"]
+      |> maybe_append_branch(repository.branch)
+      |> Kernel.++([repository.source, destination_argument(workspace, destination)])
+
+    Logger.info(
+      "Cloning workspace repository issue_id=#{issue_context.issue_id || "n/a"} issue_identifier=#{issue_context.issue_identifier || "issue"} repository=#{repository.name} destination=#{repository.relative_path}"
+    )
+
+    case System.cmd(git, args, cd: workspace, stderr_to_stdout: true) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        {:error, {:workspace_repository_clone_failed, repository.name, status, output}}
+    end
+  end
+
+  defp maybe_append_branch(args, nil), do: args
+  defp maybe_append_branch(args, branch), do: args ++ ["--branch", branch]
+
+  defp destination_argument(workspace, destination) do
+    if destination == workspace, do: ".", else: Path.relative_to(destination, workspace)
+  end
+
   defp maybe_run_before_remove_hook(workspace) do
     hooks = Config.settings!().hooks
 
@@ -248,28 +335,41 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      issue: issue
+    }
+  end
+
+  defp issue_context(%{issue_id: issue_id, issue_identifier: identifier}) do
+    %{
+      issue_id: issue_id,
+      issue_identifier: identifier || "issue",
+      issue: %{id: issue_id, identifier: identifier}
     }
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
     %{
       issue_id: nil,
-      issue_identifier: identifier
+      issue_identifier: identifier,
+      issue: nil
     }
   end
 
   defp issue_context(_identifier) do
     %{
       issue_id: nil,
-      issue_identifier: "issue"
+      issue_identifier: "issue",
+      issue: nil
     }
   end
 
   defp issue_log_context(%{issue_id: issue_id, issue_identifier: issue_identifier}) do
     "issue_id=#{issue_id || "n/a"} issue_identifier=#{issue_identifier || "issue"}"
   end
+
+  defp issue_from_context(%{issue: issue}), do: issue
 end

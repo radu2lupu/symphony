@@ -40,6 +40,53 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace clones configured repositories into the issue root and subdirectories" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-multi-repo-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      primary_repo = Path.join(test_root, "primary")
+      docs_repo = Path.join(test_root, "docs")
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(primary_repo)
+      File.mkdir_p!(docs_repo)
+      File.write!(Path.join(primary_repo, "README.md"), "primary\n")
+      File.write!(Path.join(docs_repo, "GUIDE.md"), "docs\n")
+
+      System.cmd("git", ["-C", primary_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", primary_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", primary_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", primary_repo, "add", "README.md"])
+      System.cmd("git", ["-C", primary_repo, "commit", "-m", "initial"])
+
+      System.cmd("git", ["-C", docs_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", docs_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", docs_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", docs_repo, "add", "GUIDE.md"])
+      System.cmd("git", ["-C", docs_repo, "commit", "-m", "initial"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        workspace_repositories: [
+          [name: "primary", source: primary_repo],
+          [name: "docs", source: docs_repo]
+        ]
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-MULTI")
+      assert File.exists?(Path.join(workspace, ".git"))
+      assert File.read!(Path.join(workspace, "README.md")) == "primary\n"
+      assert File.exists?(Path.join([workspace, "docs", ".git"]))
+      assert File.read!(Path.join([workspace, "docs", "GUIDE.md"])) == "docs\n"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace path is deterministic per issue identifier" do
     workspace_root =
       Path.join(
@@ -742,6 +789,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+    assert config.workspace.repositories == []
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"
 
@@ -762,7 +810,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "type" => "workspaceWrite",
              "writableRoots" => [canonical_default_workspace_root],
              "readOnlyAccess" => %{"type" => "fullAccess"},
-             "networkAccess" => false,
+             "networkAccess" => true,
              "excludeTmpdirEnvVar" => false,
              "excludeSlashTmp" => false
            }
@@ -881,31 +929,54 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   test "config resolves $VAR references for env-backed secret and path values" do
     workspace_env_var = "SYMP_WORKSPACE_ROOT_#{System.unique_integer([:positive])}"
     api_key_env_var = "SYMP_LINEAR_API_KEY_#{System.unique_integer([:positive])}"
+    repo_env_var = "SYMP_REPO_SOURCE_#{System.unique_integer([:positive])}"
     workspace_root = Path.join("/tmp", "symphony-workspace-root")
     api_key = "resolved-secret"
+    repo_source = Path.join("/tmp", "repo-source")
     codex_bin = Path.join(["~", "bin", "codex"])
 
     previous_workspace_root = System.get_env(workspace_env_var)
     previous_api_key = System.get_env(api_key_env_var)
+    previous_repo_source = System.get_env(repo_env_var)
 
     System.put_env(workspace_env_var, workspace_root)
     System.put_env(api_key_env_var, api_key)
+    System.put_env(repo_env_var, repo_source)
 
     on_exit(fn ->
       restore_env(workspace_env_var, previous_workspace_root)
       restore_env(api_key_env_var, previous_api_key)
+      restore_env(repo_env_var, previous_repo_source)
     end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "$#{api_key_env_var}",
       workspace_root: "$#{workspace_env_var}",
+      workspace_repositories: [[name: "main", source: "$#{repo_env_var}", path: "services/main"]],
       codex_command: "#{codex_bin} app-server"
     )
 
     config = Config.settings!()
     assert config.tracker.api_key == api_key
     assert config.workspace.root == Path.expand(workspace_root)
+
+    assert Enum.map(config.workspace.repositories, &{&1.name, &1.source, &1.path}) == [
+             {"main", Path.expand(repo_source), "services/main"}
+           ]
+
     assert config.codex.command == "#{codex_bin} app-server"
+  end
+
+  test "config rejects duplicate resolved workspace repository checkout paths" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_repositories: [
+        [name: "primary", source: "https://example.com/primary.git"],
+        [name: "other", source: "https://example.com/other.git", path: "."]
+      ]
+    )
+
+    assert {:error, {:duplicate_workspace_repository_path, ".", "primary", "other"}} =
+             Config.validate!()
   end
 
   test "config no longer resolves legacy env: references" do
@@ -1052,7 +1123,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "type" => "workspaceWrite",
              "writableRoots" => [Path.expand(Path.join(System.tmp_dir!(), "symphony_workspaces"))],
              "readOnlyAccess" => %{"type" => "fullAccess"},
-             "networkAccess" => false,
+             "networkAccess" => true,
              "excludeTmpdirEnvVar" => false,
              "excludeSlashTmp" => false
            }
@@ -1067,7 +1138,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
              "type" => "workspaceWrite",
              "writableRoots" => [Path.expand("/tmp/workspace")],
              "readOnlyAccess" => %{"type" => "fullAccess"},
-             "networkAccess" => false,
+             "networkAccess" => true,
              "excludeTmpdirEnvVar" => false,
              "excludeSlashTmp" => false
            }
@@ -1182,5 +1253,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
     assert Config.workflow_prompt() == workflow_prompt
+  end
+
+  test "total recall config defaults are exposed through config helpers" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      total_recall_enabled: true,
+      total_recall_command: "total-recall",
+      total_recall_verify_evidence: true
+    )
+
+    assert Config.total_recall_enabled?()
+    assert Config.total_recall_command() == "total-recall"
+    assert Config.verify_total_recall_evidence?()
   end
 end

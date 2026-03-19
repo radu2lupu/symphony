@@ -373,6 +373,26 @@ Fields:
   - `~` and strings containing path separators are expanded.
   - Bare strings without path separators are preserved as-is (relative roots are allowed but
     discouraged).
+- `registry_path` (path string or `$VAR`, optional)
+  - Default: `<workspace.root>/.symphony_repo_registry.json`
+  - Stores a durable local repository registry outside individual issue workspaces.
+  - Relative values are resolved relative to `workspace.root`.
+- `repositories` (array of objects, optional)
+  - Default: empty list.
+  - Declares repository checkouts that should be materialized inside each newly created issue
+    workspace before `hooks.after_create` runs.
+  - Each entry has:
+    - `name` (string, required)
+    - `source` (string, required)
+      - Implementation-defined checkout source, for example a Git URL or a local Git path.
+    - `path` (relative path string, optional)
+      - Destination inside the issue workspace.
+      - Must stay inside the issue workspace; absolute paths and escaping paths are invalid.
+      - If omitted, implementations may choose a default layout. A common strategy is to place the
+        first repository at `.` and later repositories under sibling subdirectories named after
+        `name`.
+    - `branch` (string, optional)
+      - Implementation-defined checkout selector, for example Git branch name.
 
 #### 5.3.4 `hooks` (object)
 
@@ -823,16 +843,27 @@ Algorithm summary:
 
 Notes:
 
-- This section does not assume any specific repository/VCS workflow.
-- Workspace preparation beyond directory creation (for example dependency bootstrap, checkout/sync,
-  code generation) is implementation-defined and is typically handled via hooks.
+- Repository checkout is optional. If `workspace.repositories` is empty and the local registry is
+  empty, the workspace may start as an empty directory.
+- Additional workspace preparation beyond directory creation and repository checkout (for example
+  dependency bootstrap, checkout sync, code generation) is implementation-defined and is typically
+  handled via hooks.
 
 ### 9.3 Optional Workspace Population (Implementation-Defined)
 
-The spec does not require any built-in VCS or repository bootstrap behavior.
+The spec does not require any built-in VCS or repository bootstrap behavior beyond the optional
+`workspace.repositories` declarations above.
 
 Implementations may populate or synchronize the workspace using implementation-defined logic and/or
 hooks (for example `after_create` and/or `before_run`).
+
+If `workspace.repositories` and/or a durable local repository registry are configured,
+implementations should materialize the selected repository copies before running `after_create` so
+hooks can rely on the checked-out files.
+
+Implementations may also support tracker-driven control work items that mutate the local repository
+registry (for example "register repo" tickets). The control-item format and routing semantics are
+implementation-defined.
 
 Failure handling:
 
@@ -1163,6 +1194,8 @@ Linear-specific requirements for `tracker.kind == "linear"`:
 - GraphQL endpoint (default `https://api.linear.app/graphql`)
 - Auth token sent in `Authorization` header
 - `tracker.project_slug` maps to Linear project `slugId`
+- `tracker.sync_project_states` may derive effective `active_states` and `terminal_states` from the
+  project's team workflow
 - Candidate issue query filters project using `project: { slugId: { eq: $projectSlug } }`
 - Issue-state refresh query uses GraphQL issue IDs with variable type `[ID!]`
 - Pagination required for candidate issues
@@ -2041,10 +2074,17 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 ### 17.7 CLI and Host Lifecycle
 
 - CLI accepts an optional positional workflow path argument (`path-to-WORKFLOW.md`)
+- Implementations may also accept a project root and resolve an internal workflow path under that
+  root (for example `.symphony/WORKFLOW.md`) so the workflow file stays an implementation detail
 - CLI uses `./WORKFLOW.md` when no workflow path argument is provided
 - CLI errors on nonexistent explicit workflow path or missing default `./WORKFLOW.md`
+- CLI may also support an interactive workflow bootstrap mode (for example `init`) that prompts for
+  required configuration and writes a starter `WORKFLOW.md` without starting the host runtime
+- If interactive bootstrap is implemented, it may inspect the configured starting repositories and
+  seed the generated prompt body with repo-specific guidance
 - CLI surfaces startup failure cleanly
 - CLI exits with success when application starts and shuts down normally
+- CLI exits with success after writing a workflow in interactive bootstrap mode
 - CLI exits nonzero when startup fails or the host process exits abnormally
 
 ### 17.8 Real Integration Profile (Recommended)

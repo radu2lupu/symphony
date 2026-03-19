@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{Orchestrator, RepoManager, StatusDashboard, Workspace}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -61,12 +61,15 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp issue_payload_body(issue_identifier, running, retry) do
+    {:ok, workspace_path} = Workspace.path_for_issue(issue_identifier)
+
     %{
       issue_identifier: issue_identifier,
       issue_id: issue_id_from_entries(running, retry),
       status: issue_status(running, retry),
       workspace: %{
-        path: Path.join(Config.settings!().workspace.root, issue_identifier)
+        path: workspace_path,
+        repositories: Enum.map(RepoManager.available_repositories(workspace_path), &workspace_repository_payload/1)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -80,6 +83,15 @@ defmodule SymphonyElixirWeb.Presenter do
       recent_events: (running && recent_events_payload(running)) || [],
       last_error: retry && retry.error,
       tracked: %{}
+    }
+  end
+
+  defp workspace_repository_payload(repository) do
+    %{
+      name: repository.name,
+      path: repository.path,
+      relative_path: repository.relative_path,
+      primary: repository.primary
     }
   end
 
@@ -105,6 +117,12 @@ defmodule SymphonyElixirWeb.Presenter do
       last_message: summarize_message(entry.last_codex_message),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
+      shared_memory: %{
+        status: Map.get(entry, :total_recall_status),
+        query: Map.get(entry, :total_recall_query),
+        relevant_memories: Map.get(entry, :total_recall_relevant_memories),
+        write_summary: Map.get(entry, :total_recall_write_summary)
+      },
       tokens: %{
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
@@ -132,6 +150,12 @@ defmodule SymphonyElixirWeb.Presenter do
       last_event: running.last_codex_event,
       last_message: summarize_message(running.last_codex_message),
       last_event_at: iso8601(running.last_codex_timestamp),
+      shared_memory: %{
+        status: Map.get(running, :total_recall_status),
+        query: Map.get(running, :total_recall_query),
+        relevant_memories: Map.get(running, :total_recall_relevant_memories),
+        write_summary: Map.get(running, :total_recall_write_summary)
+      },
       tokens: %{
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,

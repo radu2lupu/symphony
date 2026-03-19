@@ -103,6 +103,20 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @comments_query """
+  query SymphonyIssueComments($issueId: String!) {
+    issue(id: $issueId) {
+      comments(first: 50) {
+        nodes {
+          id
+          body
+          updatedAt
+        }
+      }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [Issue.t()]} | {:error, term()}
   def fetch_candidate_issues do
     tracker = Config.settings!().tracker
@@ -117,7 +131,7 @@ defmodule SymphonyElixir.Linear.Client do
 
       true ->
         with {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(project_slug, tracker.active_states, assignee_filter)
+          do_fetch_by_states(project_slug, Config.dispatchable_active_states(), assignee_filter)
         end
     end
   end
@@ -157,6 +171,14 @@ defmodule SymphonyElixir.Linear.Client do
         with {:ok, assignee_filter} <- routing_assignee_filter() do
           do_fetch_issue_states(ids, assignee_filter)
         end
+    end
+  end
+
+  @spec fetch_comments(String.t()) :: {:ok, [map()]} | {:error, term()}
+  def fetch_comments(issue_id) when is_binary(issue_id) do
+    with {:ok, body} <- graphql(@comments_query, %{issueId: issue_id}),
+         {:ok, comments} <- decode_comments_response(body) do
+      {:ok, comments}
     end
   end
 
@@ -418,6 +440,21 @@ defmodule SymphonyElixir.Linear.Client do
   defp decode_linear_response(_unknown, _assignee_filter) do
     {:error, :linear_unknown_payload}
   end
+
+  defp decode_comments_response(%{"data" => %{"issue" => %{"comments" => %{"nodes" => nodes}}}})
+       when is_list(nodes) do
+    {:ok,
+     Enum.map(nodes, fn node ->
+       %{
+         id: node["id"],
+         body: node["body"],
+         updated_at: parse_datetime(node["updatedAt"])
+       }
+     end)}
+  end
+
+  defp decode_comments_response(%{"errors" => errors}), do: {:error, {:linear_graphql_errors, errors}}
+  defp decode_comments_response(_response), do: {:error, :linear_unknown_payload}
 
   defp decode_linear_page_response(
          %{
